@@ -3797,11 +3797,34 @@ pub fn run(mut controller: Controller) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::controller::Source;
+    use crate::config::Config;
+    use crate::controller::{AlgorithmInfo, RoleInfo, Source};
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use strum::IntoEnumIterator;
+
+    fn press(app: &mut App, code: KeyCode) -> Option<Request> {
+        app.key(KeyEvent::from(code))
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// This function runs one request the way the worker thread does.
+    fn work(app: &mut App, controller: &mut Controller, request: Option<Request>) {
+        let (jobs, inbox) = mpsc::channel();
+        app.start(&jobs, request.expect("a request"))
+            .expect("start");
+        let Ok(Job::Run(action)) = inbox.try_recv() else {
+            panic!("the request runs no action");
+        };
+        let reply = controller.dispatch(action);
+        let next = app.finish(Some(reply), controller.snapshot().map(Box::new));
+        assert!(next.is_none());
+    }
 
     fn screen(app: &mut App, tab: Tab) -> String {
         app.tab = tab;
@@ -3942,5 +3965,211 @@ mod tests {
             .filter(|kind| !ACTIONS.iter().any(|&(.., flow)| flow.contains(kind)))
             .collect();
         assert!(missing.is_empty(), "No key runs {missing:?}");
+    }
+
+    #[test]
+    // A review window submits only after its exact word, and it sends the reviewed token or
+    // revision unchanged.
+    fn reviews_submit_only_after_the_confirmation_word() {
+        let data = Snapshot::default();
+        let submit = |kind, typed: &str| {
+            let form = Form::new(kind, "", vec![("", typed.to_string())]);
+            match form.action(&data) {
+                Ok(Submit::Run(action)) => Some(action),
+                _ => None,
+            }
+        };
+        assert!(matches!(
+            submit(FormKind::Update(Some("t".into())), "UPDATE"),
+            Some(Action::Update { preview_token: Some(token) }) if token == "t"
+        ));
+        assert!(submit(FormKind::Update(None), "update").is_none());
+        let save = || FormKind::Save(Box::new(Action::CheckConfig {}));
+        assert!(matches!(
+            submit(save(), "SAVE"),
+            Some(Action::CheckConfig {})
+        ));
+        assert!(submit(save(), "save").is_none());
+        let remove = || FormKind::Remove {
+            generation: 3,
+            route: "r".into(),
+            id: "public".into(),
+            revision: "reviewed".into(),
+        };
+        assert!(matches!(
+            submit(remove(), "public"),
+            Some(Action::Remove { generation: 3, route, id, revision: Some(revision) })
+                if route == "r" && id == "public" && revision == "reviewed"
+        ));
+        assert!(submit(remove(), "Public").is_none());
+    }
+
+    #[test]
+    // Filtering keeps a selected route that still matches and otherwise selects the first
+    // match, so a route action never runs on a route that the filter hides.
+    fn route_filter_keeps_a_matching_selection() {
+        let route = |key: &str, label: &str| RouteInfo {
+            key: key.into(),
+            id: key.into(),
+            label: label.into(),
+            ..RouteInfo::default()
+        };
+        let snapshot = Snapshot {
+            routes: vec![
+                route("a", "alpha"),
+                route("b", "beta"),
+                route("c", "alpine"),
+            ],
+            ..Snapshot::default()
+        };
+        let mut app = App::new(Theme::new(false), snapshot);
+        app.tab = Tab::Routes;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('/'));
+        let selected = |app: &App| app.selected_route().map(|route| route.key.clone());
+        for (filter, expected) in [("beta", "b"), ("", "b"), ("al", "a")] {
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            type_text(&mut app, filter);
+            assert_eq!(
+                selected(&app),
+                Ok(expected.to_string()),
+                "filter {filter:?}"
+            );
+        }
+        type_text(&mut app, " missing");
+        press(&mut app, KeyCode::Enter);
+        assert!(selected(&app).is_err());
+        assert!(press(&mut app, KeyCode::Char('d')).is_none());
+        assert!(
+            !matches!(app.popup, Some(Popup::Review { .. })),
+            "a hidden route opened the delete review"
+        );
+    }
+
+    #[test]
+    // The details must name a model for every role, including random-split models beyond the
+    // two that a new random route starts with.
+    fn route_details_list_every_model() {
+        let role = |label: &str| RoleInfo {
+            label: label.into(),
+            ..RoleInfo::default()
+        };
+        let choice = |model: &str| Choice {
+            client: "c".into(),
+            model: model.into(),
+        };
+        let snapshot = Snapshot {
+            routes: vec![RouteInfo {
+                key: "split".into(),
+                id: "team-split".into(),
+                kind: "random".into(),
+                editable: true,
+                choices: vec![choice("one"), choice("two"), choice("three")],
+                generated: Some("switchyard-setup".into()),
+                ..RouteInfo::default()
+            }],
+            algorithms: vec![AlgorithmInfo {
+                kind: "random",
+                title: "Random split",
+                roles: vec![role("Model 1"), role("Model 2")],
+                ..AlgorithmInfo::default()
+            }],
+            ..Snapshot::default()
+        };
+        let mut app = App::new(Theme::new(false), snapshot);
+        let text = screen(&mut app, Tab::Routes);
+        for line in [
+            "Model 1    c / one",
+            "Model 2    c / two",
+            "Model 3    c / three",
+        ] {
+            assert!(text.contains(line), "missing {line:?}:\n{text}");
+        }
+        assert!(text.contains("Generated by switchyard-setup"));
+    }
+
+    #[test]
+    // A model-list key must never appear on screen.
+    fn model_list_key_stays_masked() {
+        let mut app = App::new(Theme::new(false), Snapshot::default());
+        app.tab = Tab::Routes;
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Tab);
+        type_text(&mut app, "sk-secret");
+        let text = screen(&mut app, Tab::Routes);
+        assert!(text.contains("API key: •••••••••"), "{text}");
+        assert!(!text.contains("sk-secret"));
+    }
+
+    #[test]
+    // A route that saved while the server failed to restart must read as a warning, not as a
+    // success, in the details window and in the status bar.
+    fn warning_replies_do_not_read_as_success() {
+        let mut app = App::new(Theme::new(false), Snapshot::default());
+        let reply = |details: Value| {
+            Some(Ok(Reply {
+                message: "Saved the route, but the restart failed.".into(),
+                data: json!({"warning": true, "details": details}),
+            }))
+        };
+        app.finish(
+            reply(json!(["Backup: server.toml.bak"])),
+            Ok(Box::default()),
+        );
+        let text = screen(&mut app, Tab::Routes);
+        assert!(text.contains(" Attention "), "{text}");
+        app.popup = None;
+        app.finish(reply(json!([])), Ok(Box::default()));
+        let text = screen(&mut app, Tab::Routes);
+        assert!(text.contains(" ! Saved the route"), "{text}");
+    }
+
+    #[test]
+    // The models form must keep the revision from when the editor opened, so a server config
+    // that changed since then fails the review and keeps the draft instead of saving old
+    // choices into the new file.
+    fn externally_changed_routes_cannot_bless_snapshot_choices() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let settings = dir.path().join("desktop.toml");
+        let routes = dir.path().join("server.toml");
+        let original = "[llm_clients.c]\n\
+                        base_url='http://localhost:1'\n\
+                        format='openai_responses'\n\
+                        [targets.m]\n\
+                        id='original'\n\
+                        llm_client='c'\n\
+                        [routes.r]\n\
+                        id='public'\n\
+                        type='passthrough'\n\
+                        target='m'\n";
+        std::fs::write(&routes, original).expect("routes");
+        std::fs::write(
+            &settings,
+            format!(
+                "config_file={routes:?}\nrouting_log={:?}\nserver_url='http://127.0.0.1:0'",
+                dir.path().join("log")
+            ),
+        )
+        .expect("settings");
+        let mut controller = Controller::new(Config::load(&settings).expect("config"), settings);
+        let mut app = App::new(Theme::new(false), controller.snapshot().expect("snapshot"));
+        app.tab = Tab::Routes;
+        assert!(press(&mut app, KeyCode::Char('e')).is_none());
+        let external = original.replace("id='original'", "id='external'");
+        std::fs::write(&routes, &external).expect("external edit");
+        let editor = press(&mut app, KeyCode::Enter);
+        work(&mut app, &mut controller, editor);
+        let preview = press(&mut app, KeyCode::Enter);
+        work(&mut app, &mut controller, preview);
+        let Some(Popup::Form(draft)) = &app.popup else {
+            panic!("the draft closed");
+        };
+        assert!(matches!(draft.kind, FormKind::RouteModels { .. }));
+        assert!(draft.error.contains("Review"), "{}", draft.error);
+        assert_eq!(
+            std::fs::read_to_string(&routes).expect("preserved"),
+            external
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).expect("files").count(), 2);
     }
 }
