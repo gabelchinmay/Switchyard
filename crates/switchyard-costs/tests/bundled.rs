@@ -18,9 +18,20 @@ fn bundled_prices_cover_direct_gateway_and_free_models() {
     // These totals are computed by hand from prices.toml.
     for (model, expected) in [
         ("claude-fable-5-1", 0.16275),
+        ("anthropic/claude-haiku-5.5", 0.001635),
         ("gemini-4-argon", 0.0321),
         ("gemini-3.8-flash", 0.012075),
+        ("google/gemini-3.8-flash", 0.0132825),
         ("deepseek-flash", 0.004506),
+        ("x-ai/grok-4.7", 0.0285),
+        ("qwen/qwen3.7-plus", 0.004944),
+        ("moonshotai/kimi-k2.6", 0.01071),
+        ("nvidia/nemotron-3.5-lightning", 0.00101),
+        ("meta/muse-wonder", 0.0642),
+        ("stepfun/step-5-preview", 0.0138),
+        ("minimax/minimax-m3.1-flash:free", 0.0),
+        ("z-ai/glm-5.3", 0.002347),
+        ("tencent/hy4-preview", 0.0105453),
     ] {
         let cost = pricing.estimate(model, &usage).expect(model);
         assert_eq!(cost.source, CostSource::Estimated);
