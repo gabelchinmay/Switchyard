@@ -5558,4 +5558,43 @@ mod tests {
         let installed = std::fs::read_to_string(&custom).expect("custom");
         assert!(installed.contains("public"), "{installed}");
     }
+
+    #[test]
+    // The open and remove keys must reach only the session that the user selected. A refresh
+    // keeps that session selected while it is listed and selects none after it leaves.
+    fn session_actions_reach_only_the_selected_session() {
+        let listed = |ids: &[&str]| Snapshot {
+            session_inventory: ids.iter().map(|id| json!({"id": id})).collect(),
+            ..Snapshot::default()
+        };
+        let open = |app: &mut App| match press(app, KeyCode::Char('o')) {
+            Some(Request {
+                job: Job::Run(Action::OpenSession { id }),
+                ..
+            }) => Some(id),
+            _ => None,
+        };
+        let mut app = App::new(Theme::new(false), listed(&["b", "a"]));
+        app.tab = Tab::Sessions;
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(open(&mut app).as_deref(), Some("a"));
+        app.apply_snapshot(Ok(listed(&["c", "b", "a"])));
+        assert_eq!(open(&mut app).as_deref(), Some("a"));
+        app.apply_snapshot(Ok(listed(&["c", "b"])));
+        assert_eq!(open(&mut app), None);
+        assert!(press(&mut app, KeyCode::Char('d')).is_none());
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(open(&mut app).as_deref(), Some("c"));
+    }
+
+    #[test]
+    // Cleanup deletes every ignored file, so a review that names only 20 must count the rest.
+    fn cleanup_review_counts_the_ignored_files_it_does_not_name() {
+        let ignored: Vec<String> = (1..=25).map(|n| format!("build/{n:02}.log")).collect();
+        let lines = cleanup_lines(Theme::new(false), &json!({"ignored": ignored}));
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert!(text.iter().any(|line| line == "build/20.log"));
+        assert!(!text.iter().any(|line| line == "build/21.log"));
+        assert!(text.iter().any(|line| line == "…and 5 more"), "{text:?}");
+    }
 }
