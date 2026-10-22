@@ -1324,3 +1324,493 @@ fn table_key(path: &str) -> Option<&str> {
     }
     path.split(['.', ']']).next().filter(|key| !key.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// This fixture uses a GPT judge and Claude on one gateway with different API formats.
+    const GATEWAY: &str = r#"schema_version = 1
+
+[llm_clients.gateway]
+format = "openai_responses"
+base_url = "https://gateway.example.com/v1"
+forward_auth = true
+
+# Claude caches prompts on the chat endpoint.
+[llm_clients.gateway_chat]
+format = "openai_chat"
+base_url = "https://gateway.example.com/v1"
+forward_auth = true
+
+# The gateway rejects any thinking setting for these models.
+[targets.gateway_capable]
+id = "claude-opus-5-5"
+llm_client = "gateway_chat"  # chat, for caching
+omit_body_fields = ["reasoning_effort"]
+
+[targets.gateway_efficient]
+id = "claude-sonnet-5"
+llm_client = "gateway_chat"
+omit_body_fields = ["reasoning_effort"]
+
+[targets.gateway_judge]
+id = "gpt-5.6-terra"
+llm_client = "gateway"
+
+[routes.gateway]
+id = "switchyard-gateway"
+type = "composite"
+context_window = 200000
+
+[routes.gateway.classifier]
+target = "gateway_judge"
+base_threshold = 0.5
+classify_trigger = "user_turn"
+message_hash_fallback = true
+
+[routes.gateway.stage]
+capable_target = "gateway_capable"
+efficient_target = "gateway_efficient"
+confidence_threshold = 0.5
+"#;
+
+    fn choice(client: &str, model: &str) -> Choice {
+        Choice {
+            client: client.to_string(),
+            model: model.to_string(),
+        }
+    }
+
+    fn algorithm(kind: &str) -> &'static Algorithm {
+        ALGORITHMS
+            .iter()
+            .find(|algorithm| algorithm.kind == kind)
+            .expect("known algorithm")
+    }
+
+    /// This function edits the config and checks the result with the server's parser.
+    fn edit(text: &str, route: &str, kind: &str, choices: &[Choice]) -> Edited {
+        let edited = ServerConfig::parse(text)
+            .expect("parse")
+            .edit(route, algorithm(kind), choices)
+            .expect("edit");
+        if let Err(error) = switchyard_runner::Runner::from_toml(&edited.text) {
+            panic!(
+                "the server rejects the edited config: {error}\n{}",
+                edited.text
+            );
+        }
+        edited
+    }
+
+    fn capable_target(config: &ServerConfig) -> Option<&str> {
+        config.target_at("gateway", &Slot::Key(&["stage", "capable_target"]))
+    }
+
+    #[test]
+    fn removing_a_route_keeps_generated_block_markers_for_retained_targets() {
+        for (suffix, target, owned) in [
+            (
+                "# >>> generated >>>\n\
+                 [routes.generated]\n\
+                 id='generated'\n\
+                 type='passthrough'\n\
+                 target='owned'\n\
+                 [targets.owned]\n\
+                 id='m'\n\
+                 llm_client='gateway'\n\
+                 # <<< generated <<<\n",
+                "owned",
+                true,
+            ),
+            (
+                "# >>> generated >>>\n\
+                 [targets.owned]\n\
+                 id='m'\n\
+                 llm_client='gateway'\n\
+                 # <<< generated <<<\n\
+                 [routes.generated]\n\
+                 id='generated'\n\
+                 type='passthrough'\n\
+                 target='owned'\n\
+                 [targets.unowned]\n\
+                 id='other'\n\
+                 llm_client='gateway'\n",
+                "unowned",
+                false,
+            ),
+            (
+                "[routes.generated]\n\
+                 id='generated'\n\
+                 type='composite'\n\
+                 # >>> generated >>>\n\
+                 [routes.generated.classifier]\n\
+                 target='owned'\n\
+                 [targets.owned]\n\
+                 id='m'\n\
+                 llm_client='gateway'\n\
+                 # <<< generated <<<\n",
+                "owned",
+                true,
+            ),
+        ] {
+            let config = ServerConfig::parse(&format!("{GATEWAY}\n{suffix}")).expect("config");
+            assert_eq!(config.generated_by("targets", target).is_some(), owned);
+            let edited = config.remove("generated").expect("remove");
+            let remaining = ServerConfig::parse(&edited.text).expect("config");
+            assert_eq!(
+                remaining.generated_by("targets", target).is_some(),
+                owned,
+                "{}",
+                edited.text
+            );
+        }
+    }
+
+    #[test]
+    // Routes can share targets, so deleting one route must leave those targets usable.
+    fn removing_a_route_preserves_shared_targets_and_other_routes() {
+        let original = format!(
+            "{GATEWAY}\n[routes.keep]\nid='keep'\ntype='passthrough'\ntarget='gateway_capable'\n"
+        );
+        let config = ServerConfig::parse(&original).expect("config");
+        let edited = config.remove("gateway").expect("remove");
+        let remaining = ServerConfig::parse(&edited.text).expect("config");
+        assert_eq!(remaining.routes().len(), 1);
+        assert_eq!(remaining.routes()[0].id, "keep");
+        assert_eq!(remaining.models_on("gateway"), config.models_on("gateway"));
+        switchyard_runner::Runner::from_toml(&edited.text).expect("server accepts remaining route");
+        assert!(config.remove("missing").is_err());
+    }
+
+    #[test]
+    fn route_tools_preserve_targets_and_reject_conflicting_names() {
+        let config = ServerConfig::parse(GATEWAY).expect("config");
+        let duplicate = config
+            .change_route("duplicate", "gateway", "copy", "copy-public", None, &[])
+            .expect("duplicate");
+        let copied = ServerConfig::parse(&duplicate.text).expect("copy");
+        let managed_text = GATEWAY
+            .replace("[routes.gateway]", "# >>> generated >>>\n[routes.gateway]")
+            + "\n# <<< generated <<<\n";
+        let managed = ServerConfig::parse(&managed_text).expect("managed source");
+        let durable = managed
+            .change_route(
+                "duplicate",
+                "gateway",
+                "durable",
+                "durable-public",
+                None,
+                &[],
+            )
+            .expect("durable duplicate");
+        let durable = ServerConfig::parse(&durable.text).expect("durable config");
+        assert!(durable.generated_by("routes", "durable").is_none());
+        assert!(durable.generated_by("routes", "gateway").is_some());
+
+        assert_eq!(copied.choices("copy"), config.choices("gateway"));
+        switchyard_runner::Runner::from_toml(&duplicate.text).expect("server accepts duplicate");
+        let rename = copied
+            .change_route("rename", "copy", "", "renamed-public", None, &[])
+            .expect("rename");
+        let renamed = ServerConfig::parse(&rename.text).expect("rename");
+        assert_eq!(renamed.choices("copy"), config.choices("gateway"));
+        assert!(
+            copied
+                .change_route("rename", "copy", "", "switchyard-gateway", None, &[])
+                .is_err()
+        );
+        for name in ["", "../bad", "a/b", "a\nb"] {
+            assert!(
+                config
+                    .change_route("duplicate", "gateway", name, "new", None, &[])
+                    .is_err()
+            );
+        }
+        // The create dialog sends one choice per role of the chosen type. A
+        // config with endpoints and no [targets] table yet must accept a route.
+        let models = [
+            choice("gateway", "manual-judge"),
+            choice("gateway", "manual-capable"),
+            choice("gateway_chat", "manual-efficient"),
+        ];
+        let (clients_only, _) = GATEWAY
+            .split_once("# The gateway rejects")
+            .expect("fixture has targets");
+        let clients_only = ServerConfig::parse(clients_only).expect("clients-only config");
+        for (source, algorithm) in [&config, &clients_only]
+            .into_iter()
+            .flat_map(|source| ALGORITHMS.iter().map(move |algorithm| (source, algorithm)))
+        {
+            let picked = &models[..algorithm.new_route_roles().len()];
+            let created = source
+                .change_route("create", "", "new", "new-public", Some(algorithm), picked)
+                .unwrap_or_else(|error| panic!("{}: {error}", algorithm.kind));
+            if let Err(error) = switchyard_runner::Runner::from_toml(&created.text) {
+                panic!(
+                    "{} route rejected: {error}\n{}",
+                    algorithm.kind, created.text
+                );
+            }
+            let created = ServerConfig::parse(&created.text).expect("created");
+            assert_eq!(
+                created.algorithm("new").map(|a| a.kind),
+                Some(algorithm.kind)
+            );
+            assert_eq!(created.choices("new"), picked);
+        }
+        let random = ALGORITHMS
+            .iter()
+            .find(|algorithm| algorithm.kind == RANDOM)
+            .expect("random");
+        let choices = vec![
+            choice("gateway", "a"),
+            choice("gateway", "b"),
+            choice("gateway", "c"),
+            choice("gateway", "d"),
+        ];
+        let expanded = config.edit("gateway", random, &choices).expect("expand");
+        let expanded = ServerConfig::parse(&expanded.text).expect("expanded");
+        assert_eq!(expanded.choices("gateway"), choices);
+        let shrunk = expanded
+            .edit("gateway", random, &choices[..2])
+            .expect("shrink");
+        let shrunk = ServerConfig::parse(&shrunk.text).expect("shrunk");
+        assert_eq!(shrunk.choices("gateway"), choices[..2]);
+        assert!(expanded.edit("gateway", random, &choices[..1]).is_err());
+    }
+
+    #[test]
+    fn every_algorithm_writes_a_config_the_server_accepts() {
+        let gateway = ServerConfig::parse(GATEWAY).expect("parse");
+        let models = [
+            choice("gateway", "gpt-5.6-terra"),
+            choice("gateway", "gpt-5.6-sol"),
+            choice("gateway_chat", "claude-sonnet-5"),
+        ];
+        for algorithm in ALGORITHMS {
+            let roles = gateway.roles("gateway", algorithm).len();
+
+            let edited = edit(GATEWAY, "gateway", algorithm.kind, &models[3 - roles..]);
+
+            let config = ServerConfig::parse(&edited.text).expect("parse");
+            assert_eq!(
+                config.algorithm("gateway").map(|a| a.kind),
+                Some(algorithm.kind)
+            );
+            assert_eq!(config.choices("gateway"), models[3 - roles..]);
+        }
+    }
+
+    #[test]
+    fn a_target_one_role_reuses_is_not_changed_for_another_role() {
+        // Capable moves to the efficient model, and Efficient moves to a new model.
+        let chosen = [
+            choice("gateway", "gpt-5.6-terra"),
+            choice("gateway_chat", "claude-sonnet-5"),
+            choice("gateway", "gpt-5.6-luna"),
+        ];
+
+        let edited = edit(GATEWAY, "gateway", "composite", &chosen);
+
+        assert_eq!(
+            ServerConfig::parse(&edited.text)
+                .expect("parse")
+                .choices("gateway"),
+            chosen
+        );
+    }
+
+    #[test]
+    fn changing_the_algorithm_replaces_only_the_route_settings() {
+        let edited = edit(
+            GATEWAY,
+            "gateway",
+            "stage_router",
+            &[
+                choice("gateway_chat", "claude-opus-5-5"),
+                choice("gateway_chat", "claude-sonnet-5"),
+            ],
+        );
+
+        let config = ServerConfig::parse(&edited.text).expect("parse");
+        assert_eq!(
+            config.algorithm("gateway").map(|a| a.kind),
+            Some("stage_router")
+        );
+        let route = config.route("gateway").expect("route");
+        assert_eq!(text(route, "id"), Some("switchyard-gateway"));
+        assert_eq!(
+            route.get("context_window").and_then(Item::as_integer),
+            Some(200000)
+        );
+        assert_eq!(text(route, "capable_target"), Some("gateway_capable"));
+        assert_eq!(text(route, "efficient_target"), Some("gateway_efficient"));
+        assert_eq!(text(route, "picker"), Some("efficient_first"));
+        assert!(route.get("classifier").is_none() && route.get("stage").is_none());
+        assert!(
+            edited.text.contains("[targets.gateway_judge]"),
+            "unused targets stay in the file"
+        );
+        let removed = edited.notes.join("\n");
+        assert!(
+            removed.contains("classifier.message_hash_fallback")
+                && !removed.contains("stage.capable_target"),
+            "the result lists the removed settings, not the replaced targets: {removed}"
+        );
+    }
+
+    #[test]
+    fn a_target_another_route_uses_is_copied_not_changed() {
+        // The shared target has a sub-table, which the copy must keep under
+        // its own header.
+        let shared = GATEWAY.replace(
+            "omit_body_fields = [\"reasoning_effort\"]\n\n[targets.gateway_efficient]",
+            "omit_body_fields = [\"reasoning_effort\"]\n\n[targets.gateway_capable.extra_body]\n\
+             top_k = 5\n\n[targets.gateway_efficient]",
+        ) + "\n[routes.direct]\n\
+             id = \"direct\"\n\
+             type = \"passthrough\"\n\
+             target = \"gateway_capable\"\n";
+
+        let edited = edit(
+            &shared,
+            "gateway",
+            "composite",
+            &[
+                choice("gateway", "gpt-5.6-terra"),
+                choice("gateway", "gpt-5.6-sol"),
+                choice("gateway_chat", "claude-sonnet-5"),
+            ],
+        );
+
+        let config = ServerConfig::parse(&edited.text).expect("parse");
+        assert_eq!(
+            config.choices("direct"),
+            [choice("gateway_chat", "claude-opus-5-5")]
+        );
+        assert_eq!(
+            config.choices("gateway")[1],
+            choice("gateway", "gpt-5.6-sol")
+        );
+        let copy = capable_target(&config).expect("capable target");
+        assert_ne!(copy, "gateway_capable");
+        let targets = config.table("targets").expect("targets");
+        let (source, copied) = (
+            targets.get("gateway_capable").and_then(Item::as_table_like),
+            targets.get(copy).and_then(Item::as_table_like),
+        );
+        for key in TARGET_SETTINGS {
+            assert_eq!(
+                source.and_then(|target| setting(target, key)),
+                copied.and_then(|target| setting(target, key)),
+                "the copy keeps {key}"
+            );
+        }
+        let header = |name: &str| edited.text.find(&format!("[{name}]")).expect(name);
+        assert!(
+            header(&format!("targets.{copy}")) < header(&format!("targets.{copy}.extra_body")),
+            "the copied sub-table follows the copy's header:\n{}",
+            edited.text
+        );
+    }
+
+    #[test]
+    fn uses_another_routes_target_only_when_the_route_keeps_its_settings_or_must_share() {
+        // `prompted` names the model that Capable moves to, and has a
+        // system prompt that the gateway route does not have.
+        for (omit, shared) in [
+            // Same request settings: the server accepts a second target for
+            // the model, so Capable keeps its own target.
+            ("omit_body_fields = [\"reasoning_effort\"]\n", false),
+            // Other request settings: the server would reject a second
+            // target, so Capable shares `prompted`, and the result says so.
+            ("", true),
+        ] {
+            let text = format!(
+                "{GATEWAY}\n[targets.prompted]\nid = \"gpt-5.6-sol\"\nllm_client = \"gateway\"\n\
+                 system_prompt = \"You answer for route other.\"\n{omit}\n[routes.other]\n\
+                 id = \"other\"\ntype = \"passthrough\"\ntarget = \"prompted\"\n"
+            );
+
+            let edited = edit(
+                &text,
+                "gateway",
+                "composite",
+                &[
+                    choice("gateway", "gpt-5.6-terra"),
+                    choice("gateway", "gpt-5.6-sol"),
+                    choice("gateway_chat", "claude-sonnet-5"),
+                ],
+            );
+
+            let config = ServerConfig::parse(&edited.text).expect("parse");
+            assert_eq!(
+                config.choices("gateway")[1],
+                choice("gateway", "gpt-5.6-sol")
+            );
+            assert_eq!(
+                capable_target(&config) == Some("prompted"),
+                shared,
+                "{omit}"
+            );
+            assert_eq!(
+                edited
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("prompted") && note.contains("other")),
+                shared,
+                "{:?}",
+                edited.notes
+            );
+        }
+    }
+
+    /// This fixture places the last target and route inside a generated block.
+    /// A hand-written route shares the capable target.
+    fn with_generated_block() -> String {
+        format!(
+            "{GATEWAY}\n[routes.direct]\nid = \"direct\"\ntype = \"passthrough\"\n\
+             target = \"gateway_capable\"\n\n\
+             # >>> sync: generated by sync.py; edits between the markers are overwritten >>>\n\n\
+             [targets.generated]\nid = \"gpt-5.5\"\nllm_client = \"gateway\"\n\n\
+             [routes.generated]\nid = \"generated\"\ntype = \"passthrough\"\n\
+             target = \"generated\"\n\n# <<< sync <<<\n"
+        )
+    }
+
+    #[test]
+    fn new_targets_stay_outside_generated_blocks() {
+        let all_generated = GATEWAY
+            .replace(
+                "# The gateway rejects",
+                "# >>> sync: generated by sync.py; edits between the markers are overwritten >>>\n\
+                 # The gateway rejects",
+            )
+            .replace("[routes.gateway]\n", "# <<< sync <<<\n\n[routes.gateway]\n")
+            + "\n[routes.direct]\nid='direct'\ntype='passthrough'\ntarget='gateway_capable'\n";
+        for text in [with_generated_block(), all_generated] {
+            let edited = edit(
+                &text,
+                "gateway",
+                "composite",
+                &[
+                    choice("gateway", "gpt-5.6-terra"),
+                    choice("gateway", "gpt-5.6-sol"),
+                    choice("gateway_chat", "claude-sonnet-5"),
+                ],
+            );
+            let config = ServerConfig::parse(&edited.text).expect("parse");
+            let copy = capable_target(&config).expect("capable target");
+            assert_ne!(copy, "gateway_capable");
+            assert_eq!(config.generated_by("targets", copy), None);
+            let header = edited
+                .text
+                .find(&format!("[targets.{copy}]"))
+                .expect("target header");
+            let marker = edited.text.find("# >>> sync").expect("block marker");
+            assert!(header < marker);
+        }
+    }
+}
