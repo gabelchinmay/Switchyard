@@ -4901,6 +4901,24 @@ mod tests {
     }
 
     #[test]
+    // The narrowest supported terminal must still show every tab, so no page's digit or name is
+    // cut off, whichever page is selected.
+    fn narrow_header_shows_every_tab() {
+        let mut app = App::new(Theme::new(false), Snapshot::default());
+        for selected in TABS {
+            let text = screen_sized(&mut app, selected, MIN_WIDTH, MIN_HEIGHT);
+            let header = text.lines().next().unwrap_or_default();
+            for tab in TABS {
+                let title = format!("{} {}", tab.index() + 1, &tab.name()[..3]);
+                assert!(
+                    header.contains(&title),
+                    "{selected:?}: {title:?} is cut off in {header:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     // The models form must keep the revision from when the editor opened, so a server config
     // that changed since then fails the review and keeps the draft instead of saving old
     // choices into the new file.
@@ -4947,5 +4965,70 @@ mod tests {
             external
         );
         assert_eq!(std::fs::read_dir(dir.path()).expect("files").count(), 2);
+    }
+
+    #[test]
+    // The p and i keys run the same preview, so only the recorded key decides whether its reply
+    // opens the install review. The review saves nothing until INSTALL is typed.
+    fn only_i_opens_the_install_review() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let settings = dir.path().join("desktop.toml");
+        let routes = dir.path().join("server.toml");
+        std::fs::write(
+            &routes,
+            "[llm_clients.c]\n\
+             base_url='https://example.com/v1'\n\
+             format='openai_chat'\n\
+             [targets.m]\n\
+             id='actual'\n\
+             llm_client='c'\n\
+             [routes.r]\n\
+             id='public'\n\
+             type='passthrough'\n\
+             target='m'\n",
+        )
+        .expect("routes");
+        std::fs::write(
+            &settings,
+            format!(
+                "config_file={routes:?}\nrouting_log={:?}\nserver_url='http://127.0.0.1:0'",
+                dir.path().join("log")
+            ),
+        )
+        .expect("settings");
+        let mut controller = Controller::new(Config::load(&settings).expect("config"), settings);
+        let mut app = App::new(Theme::new(false), controller.snapshot().expect("snapshot"));
+        app.tab = Tab::Harnesses;
+        // A custom file keeps the install inside the fixture instead of the user's settings.
+        let claude = app
+            .data
+            .tools
+            .iter()
+            .position(|t| t.tool == Harness::Claude);
+        app.harness = claude.expect("Claude Code");
+        let custom = dir.path().join("claude.json");
+        std::fs::write(&custom, "{\"user\":true}").expect("custom");
+        press(&mut app, KeyCode::Char('x'));
+        type_text(&mut app, custom.to_str().expect("path"));
+        press(&mut app, KeyCode::Enter);
+
+        let preview = press(&mut app, KeyCode::Char('p'));
+        work(&mut app, &mut controller, preview);
+        assert!(app.popup.is_none(), "p opened a window");
+        assert!(screen(&mut app, Tab::Harnesses).contains("SETTINGS DIFF"));
+
+        let review = press(&mut app, KeyCode::Char('i'));
+        work(&mut app, &mut controller, review);
+        assert!(matches!(app.popup, Some(Popup::Review { .. })));
+        type_text(&mut app, "install");
+        assert!(press(&mut app, KeyCode::Enter).is_none());
+        let unchanged = std::fs::read_to_string(&custom).expect("custom");
+        assert_eq!(unchanged, "{\"user\":true}");
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_text(&mut app, "INSTALL");
+        let install = press(&mut app, KeyCode::Enter);
+        work(&mut app, &mut controller, install);
+        let installed = std::fs::read_to_string(&custom).expect("custom");
+        assert!(installed.contains("public"), "{installed}");
     }
 }
